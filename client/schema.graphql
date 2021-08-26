@@ -1,0 +1,17 @@
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+type Mutation {
+  createRecord(recordName: String!): Record
+}
+
+type Query {
+  getRecord(recordId: ID!): Record
+}
+
+type Record {
+  recordId: ID!
+  recordName: String
+}

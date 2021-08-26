@@ -16,5 +16,5 @@ This project contains source code and supporting files for a serverless applicat
 
 ## CI/CD Pipelines
 
-This project currently only contains a front-end deployment Pipeline through Amplify, but I would use sam pipelines with GitHub actions to deploy 
+This project currently only contains a front-end deployment Pipeline through Amplify, but I would use sam pipelines with GitHub actions to deploy the AWS resources
 

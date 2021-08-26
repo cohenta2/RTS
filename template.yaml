@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  rts
+
+  Sample SAM Template for rts
+
+Globals:
+  Function:
+    Runtime: python3.7
+    Timeout: 3
+    Handler: app.lambda_handler
+
+Resources:
+
+  ###############################
+  ###        Amplify          ###
+  ###############################
+
+  AmplifyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - amplify.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AmplifyAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "amplify:*"
+                Resource: "*"
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: amplify-app
+      Repository: #FrontEnd Repo Here
+      AccessToken: "{{resolve:secretsmanager:github-secret-token}}" #Access Token for GitHub Account
+      IAMServiceRole: !GetAtt AmplifyRole.Arn
+      EnvironmentVariables:
+        - Name: ENDPOINT
+          Value: !GetAtt Api.GraphQLUrl
+        - Name: API_KEY
+          Value: !GetAtt AppSyncApiKey.ApiKey
+        - Name: REGION
+          Value: !Ref AWS::Region
+      BuildSpec: |-
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - cd client
+                - npm ci
+            build:
+              commands:
+                - echo "REACT_APP_ENDPOINT=$ENDPOINT" >> .env
+                - echo "REACT_APP_REGION=$REGION" >> .env
+                - echo "REACT_APP_API_KEY=$API_KEY" >> .env
+                - npm run build
+          artifacts:
+            baseDirectory: client/build
+            files:
+              - "**/*"
+          cache:
+            paths:
+              - node_modules/**/*
+  
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: true
+
+
+  ###############################
+  ###        Topics/Queues    ###
+  ###############################
+
+  Topic:
+    Type: AWS::SNS::Topic
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref Topic
+      Endpoint: !GetAtt Subscriber.Arn
+      RawMessageDelivery: true
+  
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: allow-sns-messages
+          Effect: Allow
+          Principal: '*'
+          Action: sqs:SendMessage
+          Resource: !GetAtt Subscriber.Arn
+      Queues:
+        - !Ref Subscriber
+
+  Subscriber:
+    Type: AWS::SQS::Queue
+
+
+  ###############################
+  ###        Lambdas          ###
+  ###############################
+
+  Publisher:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: publisher/
+      Environment:
+        Variables:
+          TOPIC: !Ref Topic
+      Events:
+        DDBEvent:
+          Type: DynamoDB
+          Properties:
+            Stream:
+              !GetAtt Table.StreamArn
+            StartingPosition: LATEST
+            Enabled: true
+      Policies:
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt Topic.TopicName}
+  
+  BusinessLogicFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: business_logic/
+      Environment:
+        Variables:
+          TABLE: !Ref Table
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Subscriber.Arn
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Table}
+
+
+  ###############################
+  ###        AppSync          ###
+  ###############################
+
+  AppSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service:
+                - "appsync.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: DynamoDbAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: 
+                  - !GetAtt Table.Arn
+
+  Api:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: my-api
+      AuthenticationType: API_KEY
+      # Could also use User based Authentication with Cognito
+  
+  AppSyncApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt Api.ApiId
+  
+  DataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      Type: "AWS_DYNAMODB"
+      ApiId: !GetAtt Api.ApiId
+      Name: create 
+      ServiceRoleArn: !GetAtt AppSyncRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref Table
+        AwsRegion: !Sub ${AWS::Region}
+  
+  Schema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt Api.ApiId
+      Definition: |
+        schema {
+          query: Query
+          mutation: Mutation
+        }
+
+        type Query {
+          getRecord(recordId: ID!): Record
+        }
+
+        type Mutation {
+          createRecord(recordName: String!): Record
+        }
+
+        type Record {
+          : String
+        }
+  
+  createRecordsMutationResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      TypeName: Mutation
+      ApiId: !GetAtt Api.ApiId
+      FieldName: "createRecord"
+      DataSourceName: !GetAtt DataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "PutItem",
+          "key": {
+            "pk": $util.dynamodb.toDynamoDBJson($ctx.args.input.pk)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($context.result)
+
+  getRecordsQueryResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      TypeName: Query
+      ApiId: !GetAtt Api.ApiId
+      FieldName: "getRecord"
+      DataSourceName: !GetAtt DataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Invoke",
+          "payload": {
+            "field": "getRecord",
+            "arguments": $utils.toJson($context.args)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($context.result)
+
+  ###############################
+  ###        DynamoDb         ###
+  ###############################
+  
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "pk"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "pk"
+          KeyType: "HASH"
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+    
